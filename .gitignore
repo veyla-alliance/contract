@@ -1,0 +1,11 @@
+# Foundry
+out/
+cache/
+broadcast/
+lib/
+
+# Environment
+.env
+
+# MacOS
+.DS_Store
