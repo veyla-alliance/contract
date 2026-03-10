@@ -12,15 +12,15 @@ import "../src/VeylaVault.sol";
 ///   source .env
 ///
 ///   forge script script/Deploy.s.sol \
-///     --rpc-url https://testnet-passet-hub-eth-rpc.polkadot.io \
+///     --rpc-url https://eth-rpc-testnet.polkadot.io \
 ///     --private-key $PRIVATE_KEY \
 ///     --broadcast
 ///
 /// Verify on Blockscout after deploy:
 ///   forge verify-contract <VAULT_ADDRESS> VeylaVault \
-///     --chain-id 420420422 \
+///     --chain-id 420420417 \
 ///     --verifier blockscout \
-///     --verifier-url https://blockscout-passet-hub.parity-testnet.parity.io/api
+///     --verifier-url https://blockscout-testnet.polkadot.io/api
 
 contract Deploy is Script {
     function run() external {
@@ -52,8 +52,8 @@ contract Deploy is Script {
         console.log("");
         console.log("=== Verify on Blockscout ===");
         console.log("forge verify-contract", address(vault), "VeylaVault \\");
-        console.log("  --chain-id 420420422 \\");
+        console.log("  --chain-id 420420417 \\");
         console.log("  --verifier blockscout \\");
-        console.log("  --verifier-url https://blockscout-passet-hub.parity-testnet.parity.io/api");
+        console.log("  --verifier-url https://blockscout-testnet.polkadot.io/api");
     }
 }

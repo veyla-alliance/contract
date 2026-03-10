@@ -1,5 +1,5 @@
 # Polkadot Hub Precompiles — Research Notes
-> Passet Hub Testnet (Chain ID: 420420422)
+> Passet Hub Testnet (Chain ID: 420420417)
 > Diperbarui: 10 Maret 2026
 
 ---
