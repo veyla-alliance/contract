@@ -9,7 +9,7 @@ import "./interfaces/IERC20Precompile.sol";
 ///         Accepts DOT (native, via msg.value) and USDT (via pallet-assets ERC-20 precompile).
 ///         Routes liquidity cross-chain via Polkadot's XCM precompile for yield optimization.
 /// @dev    Built for Polkadot Solidity Hackathon 2026 — Track 2: PVM Smart Contracts.
-///         Deployed on Passet Hub Testnet (chain ID 420420422).
+///         Deployed on Passet Hub Testnet (chain ID 420420417).
 contract VeylaVault {
 
     // ── Sentinel for DOT (native Polkadot asset) ──────────────────────────
@@ -53,7 +53,8 @@ contract VeylaVault {
     event Deposited(address indexed user, address indexed token, uint256 amount);
     event Withdrawn(address indexed user, address indexed token, uint256 amount);
     event YieldClaimed(address indexed user, address indexed token, uint256 amount);
-    event Routed(address indexed token, address destination, uint256 amount);
+    event RoutedLocally(address indexed token, uint256 amount);
+    event RoutedCrossChain(address indexed token, bytes destination, uint256 amount);
     event ApyUpdated(address indexed token, uint256 newApyBps);
     event Paused(bool isPaused);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
@@ -273,7 +274,7 @@ contract VeylaVault {
         // Execute XCM message via Polkadot Hub native precompile
         IXcm(XCM_PRECOMPILE).execute(xcmMessage, weight);
 
-        emit Routed(token, XCM_PRECOMPILE, _tvl[token]);
+        emit RoutedLocally(token, _tvl[token]);
     }
 
     /// @notice Send an XCM message to another parachain (cross-chain routing).
@@ -291,7 +292,7 @@ contract VeylaVault {
         // Send XCM message cross-chain to target parachain
         IXcm(XCM_PRECOMPILE).send(destination, xcmMessage);
 
-        emit Routed(token, XCM_PRECOMPILE, _tvl[token]);
+        emit RoutedCrossChain(token, destination, _tvl[token]);
     }
 
     // ── Admin: Config ─────────────────────────────────────────────────────

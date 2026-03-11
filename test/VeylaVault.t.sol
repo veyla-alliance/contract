@@ -415,7 +415,7 @@ contract VeylaVaultTest is Test {
         bytes memory xcmMsg = hex"050c000401000003008c864713";
 
         vm.expectEmit(true, false, false, false);
-        emit VeylaVault.Routed(address(0), XCM_PRECOMPILE, 5 ether);
+        emit VeylaVault.RoutedLocally(address(0), 5 ether);
 
         vault.routeAssets(address(0), xcmMsg);
     }
@@ -434,7 +434,7 @@ contract VeylaVaultTest is Test {
         bytes memory xcmMsg = hex"050c000401000003008c864713";
 
         vm.expectEmit(true, false, false, false);
-        emit VeylaVault.Routed(address(0), XCM_PRECOMPILE, 5 ether);
+        emit VeylaVault.RoutedCrossChain(address(0), dest, 5 ether);
 
         vault.sendCrossChain(address(0), dest, xcmMsg);
     }
