@@ -389,15 +389,65 @@ contract VeylaVaultTest is Test {
         vault.withdraw(address(0), 1 ether);
     }
 
-    function test_transferOwnership() public {
+    // ── setApy: cap ───────────────────────────────────────────────────────
+
+    function test_setApy_revertIfExceedsCap() public {
+        vm.expectRevert(VeylaVault.ApyExceedsCap.selector);
+        vault.setApy(address(0), 10_001); // 100.01% → must revert
+    }
+
+    function test_setApy_allowsMaxCap() public {
+        vault.setApy(address(0), 10_000); // exactly 100% → must succeed
+        assertEq(vault.currentApy(address(0)), 10_000);
+    }
+
+    function testFuzz_setApy_revertAboveCap(uint256 apyBps) public {
+        vm.assume(apyBps > 10_000);
+        vm.expectRevert(VeylaVault.ApyExceedsCap.selector);
+        vault.setApy(address(0), apyBps);
+    }
+
+    // ── transferOwnership: 2-step ─────────────────────────────────────────
+
+    function test_transferOwnership_pendingOnly() public {
+        // Step 1: ownership NOT transferred yet, only pendingOwner set
         vault.transferOwnership(alice);
-        assertEq(vault.owner(), alice);
+        assertEq(vault.owner(),        address(this)); // still original owner
+        assertEq(vault.pendingOwner(), alice);
+    }
+
+    function test_transferOwnership_acceptCompletes() public {
+        // Step 1 + Step 2: ownership finalised after accept
+        vault.transferOwnership(alice);
+        vm.prank(alice);
+        vault.acceptOwnership();
+        assertEq(vault.owner(),        alice);
+        assertEq(vault.pendingOwner(), address(0));
     }
 
     function test_transferOwnership_revertIfNotOwner() public {
         vm.prank(alice);
         vm.expectRevert(VeylaVault.NotOwner.selector);
         vault.transferOwnership(bob);
+    }
+
+    function test_transferOwnership_revertIfZeroAddress() public {
+        vm.expectRevert(VeylaVault.ZeroAddress.selector);
+        vault.transferOwnership(address(0));
+    }
+
+    function test_acceptOwnership_revertIfNotPending() public {
+        // bob was never nominated — must revert
+        vm.prank(bob);
+        vm.expectRevert(VeylaVault.NoPendingOwner.selector);
+        vault.acceptOwnership();
+    }
+
+    function test_acceptOwnership_revertIfWrongAddress() public {
+        vault.transferOwnership(alice);
+        vm.prank(bob); // bob is not pendingOwner
+        vm.expectRevert(VeylaVault.NoPendingOwner.selector);
+        vault.acceptOwnership();
     }
 
     // ── Fuzz Tests ────────────────────────────────────────────────────────

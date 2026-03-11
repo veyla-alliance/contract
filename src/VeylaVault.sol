@@ -21,9 +21,14 @@ contract VeylaVault {
     // Asset ID 1984 (0x7C0) → precompile address formula: [assetId 8hex][24 zeros][01200000]
     address public constant USDT = USDT_PRECOMPILE;
 
+    // ── APY cap ───────────────────────────────────────────────────────────
+    // Prevents catastrophic drain: owner cannot set APY above 100% (10_000 bps).
+    uint256 public constant MAX_APY_BPS = 10_000;
+
     // ── State ─────────────────────────────────────────────────────────────
 
     address public owner;
+    address public pendingOwner;
     bool public paused;
 
     // user → token → deposited principal (in token's native decimals)
@@ -50,6 +55,7 @@ contract VeylaVault {
     event Routed(address indexed token, address destination, uint256 amount);
     event ApyUpdated(address indexed token, uint256 newApyBps);
     event Paused(bool isPaused);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     // ── Errors ────────────────────────────────────────────────────────────
@@ -61,6 +67,9 @@ contract VeylaVault {
     error UnsupportedToken();
     error ContractPaused();
     error MsgValueMismatch();
+    error ApyExceedsCap();
+    error ZeroAddress();
+    error NoPendingOwner();
 
     // ── Modifiers ─────────────────────────────────────────────────────────
 
@@ -115,31 +124,70 @@ contract VeylaVault {
     // ── Withdraw ──────────────────────────────────────────────────────────
 
     /// @notice Withdraw deposited assets from the vault.
+    ///         Pays back principal + all accrued yield to the caller.
     /// @param  token   address(0) for DOT, USDT_PRECOMPILE for USDT.
-    /// @param  amount  Amount to withdraw (in token's native decimals).
+    /// @param  amount  Amount of PRINCIPAL to withdraw (in token's native decimals).
+    /// @dev    Yield funds come from XCM returns (via receive()) or owner-funded yield pool.
+    ///         If vault lacks funds for yield payout, the transaction will revert — this
+    ///         is intentional: it signals that XCM yield hasn't been returned yet.
     function withdraw(address token, uint256 amount) external notPaused {
         if (amount == 0) revert ZeroAmount();
         if (_balances[msg.sender][token] < amount) revert InsufficientBalance();
 
-        // Snapshot pending yield before reducing balance
+        // Snapshot all pending yield into _accruedYield before touching balance
         _accrueYield(msg.sender, token);
 
-        _balances[msg.sender][token] -= amount;
-        _tvl[token] -= amount;
+        uint256 yieldDue    = _accruedYield[msg.sender][token];
+        uint256 totalPayout = amount + yieldDue;
+
+        // ── Checks-Effects-Interactions: update state BEFORE external call ──
+        _balances[msg.sender][token]   -= amount;
+        _tvl[token]                    -= amount;
+        _accruedYield[msg.sender][token] = 0;   // yield claimed — reset to prevent double-payout
 
         if (token == DOT) {
-            (bool ok,) = payable(msg.sender).call{value: amount}("");
+            // totalPayout = principal + accrued yield
+            // Vault receives XCM yield returns via receive() — if balance is insufficient,
+            // the call reverts (user should wait for XCM return or owner to fund yield pool)
+            (bool ok,) = payable(msg.sender).call{value: totalPayout}("");
             if (!ok) revert TransferFailed();
 
         } else if (token == USDT) {
-            bool ok = IERC20Precompile(USDT).transfer(msg.sender, amount);
+            bool ok = IERC20Precompile(USDT).transfer(msg.sender, totalPayout);
             if (!ok) revert TransferFailed();
 
         } else {
             revert UnsupportedToken();
         }
 
-        emit Withdrawn(msg.sender, token, amount);
+        emit Withdrawn(msg.sender, token, totalPayout);
+    }
+
+    /// @notice Claim accrued yield without withdrawing the principal.
+    ///         Useful for harvesting yield while keeping the position open.
+    /// @param  token  address(0) for DOT, USDT_PRECOMPILE for USDT.
+    function claimYield(address token) external notPaused {
+        if (token != DOT && token != USDT) revert UnsupportedToken();
+
+        // Snapshot pending yield into _accruedYield
+        _accrueYield(msg.sender, token);
+
+        uint256 yieldDue = _accruedYield[msg.sender][token];
+        if (yieldDue == 0) revert ZeroAmount();
+
+        // Reset yield before transfer (CEI)
+        _accruedYield[msg.sender][token] = 0;
+
+        if (token == DOT) {
+            (bool ok,) = payable(msg.sender).call{value: yieldDue}("");
+            if (!ok) revert TransferFailed();
+        } else {
+            bool ok = IERC20Precompile(USDT).transfer(msg.sender, yieldDue);
+            if (!ok) revert TransferFailed();
+        }
+
+        // Reuse Withdrawn event with just the yield amount (type distinction via on-chain analysis)
+        emit Withdrawn(msg.sender, token, yieldDue);
     }
 
     // ── Read (matches frontend ABI exactly) ───────────────────────────────
@@ -160,8 +208,10 @@ contract VeylaVault {
         return _apyBps[token];
     }
 
-    /// @notice Returns combined TVL across all assets (raw units, not USD).
-    ///         A price oracle would be needed for true USD TVL.
+    /// @notice Returns combined TVL across all assets in RAW token units (NOT USD).
+    /// @dev    WARNING: This naively adds DOT (18 decimals in PolkaVM) + USDT (6 decimals).
+    ///         The result is only meaningful as an aggregate count, NOT a USD value.
+    ///         Use tvlOf(token) per-asset + a price oracle for accurate USD TVL.
     function tvl() external view returns (uint256) {
         return _tvl[DOT] + _tvl[USDT];
     }
@@ -215,7 +265,9 @@ contract VeylaVault {
 
     /// @notice Update APY for a token (owner only).
     /// @param  apyBps  New APY in basis points (e.g. 1420 = 14.20%).
+    ///                 Capped at MAX_APY_BPS (10_000 = 100%) to prevent drain attacks.
     function setApy(address token, uint256 apyBps) external onlyOwner {
+        if (apyBps > MAX_APY_BPS) revert ApyExceedsCap();
         _apyBps[token] = apyBps;
         emit ApyUpdated(token, apyBps);
     }
@@ -226,10 +278,30 @@ contract VeylaVault {
         emit Paused(_paused);
     }
 
-    /// @notice Transfer contract ownership.
+    /// @notice Step 1 — Nominate a new owner. Ownership does NOT transfer until
+    ///         the nominee calls acceptOwnership(). This prevents permanent lock-out
+    ///         from a typo or wrong address.
     function transferOwnership(address newOwner) external onlyOwner {
-        emit OwnershipTransferred(owner, newOwner);
-        owner = newOwner;
+        if (newOwner == address(0)) revert ZeroAddress();
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    /// @notice Step 2 — Pending owner accepts and finalises the transfer.
+    ///         Only callable by the address nominated in transferOwnership().
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert NoPendingOwner();
+        emit OwnershipTransferred(owner, pendingOwner);
+        owner        = pendingOwner;
+        pendingOwner = address(0);
+    }
+
+    /// @notice Fund the yield pool with native DOT so withdraw() can pay yield.
+    ///         In production, yield funds come automatically via XCM returns (receive()).
+    ///         On testnet, owner can call this to manually seed the yield pool for demos.
+    function fundYieldPool() external payable onlyOwner {
+        // Simply accept the transfer — vault balance increases, enabling yield payouts.
+        // No state changes needed: receive() also handles this.
     }
 
     // ── Internal ──────────────────────────────────────────────────────────
