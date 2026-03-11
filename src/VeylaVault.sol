@@ -59,6 +59,7 @@ contract VeylaVault {
     event Paused(bool isPaused);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event YieldPoolFunded(address indexed from, uint256 amount);
 
     // ── Errors ────────────────────────────────────────────────────────────
 
@@ -335,7 +336,7 @@ contract VeylaVault {
     ///         On testnet, owner can call this to manually seed the yield pool for demos.
     function fundYieldPool() external payable onlyOwner {
         // Simply accept the transfer — vault balance increases, enabling yield payouts.
-        // No state changes needed: receive() also handles this.
+        emit YieldPoolFunded(msg.sender, msg.value);
     }
 
     // ── Internal ──────────────────────────────────────────────────────────
@@ -362,5 +363,8 @@ contract VeylaVault {
     // ── Fallback ──────────────────────────────────────────────────────────
 
     /// @dev Accept direct DOT transfers (e.g. from XCM callbacks).
-    receive() external payable {}
+    ///      Emits YieldPoolFunded so every inbound payment is traceable on-chain.
+    receive() external payable {
+        emit YieldPoolFunded(msg.sender, msg.value);
+    }
 }

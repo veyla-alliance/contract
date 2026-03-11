@@ -541,8 +541,27 @@ contract VeylaVaultTest is Test {
         vault.acceptOwnership();
     }
 
+    // ── YieldPoolFunded event ──────────────────────────────────────────────
+
+    function test_fundYieldPool_emitsEvent() public {
+        uint256 amount = 1 ether;
+        vm.expectEmit(true, false, false, true);
+        emit VeylaVault.YieldPoolFunded(address(this), amount);
+        vault.fundYieldPool{value: amount}();
+    }
+
+    function test_receive_emitsYieldPoolFunded() public {
+        uint256 amount = 0.5 ether;
+        vm.deal(address(this), amount);
+        vm.expectEmit(true, false, false, true);
+        emit VeylaVault.YieldPoolFunded(address(this), amount);
+        (bool ok,) = payable(address(vault)).call{value: amount}("");
+        assertTrue(ok);
+    }
+
     // ── Fuzz Tests ────────────────────────────────────────────────────────
 
+    /// @dev L-1: principal always returned even when time has elapsed and yield accrued.
     function testFuzz_depositAndWithdrawDot(uint96 amount) public {
         vm.assume(amount > 0 && amount <= 50 ether);
         vm.deal(alice, amount);
@@ -556,6 +575,30 @@ contract VeylaVaultTest is Test {
         assertEq(vault.balanceOf(alice, address(0)), 0);
     }
 
+    /// @dev L-1 extended: principal + yield returned when pool is funded.
+    function testFuzz_depositWarpAndWithdrawDot(uint96 amount, uint32 elapsed) public {
+        vm.assume(amount > 0 && amount <= 50 ether);
+        vm.assume(elapsed > 0 && elapsed <= 365 days);
+        vm.deal(alice, uint256(amount) * 2); // extra headroom for yield funding
+
+        vm.prank(alice);
+        vault.deposit{value: uint256(amount)}(address(0), 0);
+
+        vm.warp(block.timestamp + elapsed);
+        uint256 yieldAccrued = vault.earned(alice, address(0));
+
+        // Owner funds yield pool — principal must never be at risk
+        vault.fundYieldPool{value: yieldAccrued + 1}(); // +1 wei rounding safety
+
+        uint256 balBefore = alice.balance;
+        vm.prank(alice);
+        vault.withdraw(address(0), amount);
+
+        assertGe(alice.balance, balBefore + amount); // at minimum, principal returned
+        assertEq(vault.balanceOf(alice, address(0)), 0);
+    }
+
+    /// @dev L-2: earned always grows, and claimYield + full withdraw work after earning.
     function testFuzz_earnedAlwaysGrowsOverTime(uint32 elapsed) public {
         vm.assume(elapsed > 0);
         uint256 principal = 10 ether;
@@ -564,6 +607,18 @@ contract VeylaVaultTest is Test {
         vault.deposit{value: principal}(address(0), 0);
 
         vm.warp(block.timestamp + elapsed);
-        assertGt(vault.earned(alice, address(0)), 0);
+        uint256 yieldAccrued = vault.earned(alice, address(0));
+        assertGt(yieldAccrued, 0);
+
+        // Fund pool and verify claimYield leaves principal intact
+        vault.fundYieldPool{value: yieldAccrued}();
+        vm.prank(alice);
+        vault.claimYield(address(0));
+        assertEq(vault.balanceOf(alice, address(0)), principal); // principal untouched
+
+        // Full withdraw succeeds after claimYield
+        vm.prank(alice);
+        vault.withdraw(address(0), principal);
+        assertEq(vault.balanceOf(alice, address(0)), 0);
     }
 }
