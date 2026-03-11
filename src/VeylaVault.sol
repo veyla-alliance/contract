@@ -52,6 +52,7 @@ contract VeylaVault {
 
     event Deposited(address indexed user, address indexed token, uint256 amount);
     event Withdrawn(address indexed user, address indexed token, uint256 amount);
+    event YieldClaimed(address indexed user, address indexed token, uint256 amount);
     event Routed(address indexed token, address destination, uint256 amount);
     event ApyUpdated(address indexed token, uint256 newApyBps);
     event Paused(bool isPaused);
@@ -124,12 +125,14 @@ contract VeylaVault {
     // ── Withdraw ──────────────────────────────────────────────────────────
 
     /// @notice Withdraw deposited assets from the vault.
-    ///         Pays back principal + all accrued yield to the caller.
+    ///         Always returns the full principal. Yield is paid from the available yield pool
+    ///         (funded by XCM returns via receive() or owner via fundYieldPool()).
+    ///         If the yield pool is insufficient, any unpaid yield remains in _accruedYield
+    ///         and can be claimed later via claimYield() — principal is NEVER locked.
     /// @param  token   address(0) for DOT, USDT_PRECOMPILE for USDT.
     /// @param  amount  Amount of PRINCIPAL to withdraw (in token's native decimals).
-    /// @dev    Yield funds come from XCM returns (via receive()) or owner-funded yield pool.
-    ///         If vault lacks funds for yield payout, the transaction will revert — this
-    ///         is intentional: it signals that XCM yield hasn't been returned yet.
+    /// @dev    Security note: this contract uses a single owner key (EOA). In production,
+    ///         replace with a multisig or timelock before mainnet deployment.
     function withdraw(address token, uint256 amount) external notPaused {
         if (amount == 0) revert ZeroAmount();
         if (_balances[msg.sender][token] < amount) revert InsufficientBalance();
@@ -137,18 +140,32 @@ contract VeylaVault {
         // Snapshot all pending yield into _accruedYield before touching balance
         _accrueYield(msg.sender, token);
 
-        uint256 yieldDue    = _accruedYield[msg.sender][token];
-        uint256 totalPayout = amount + yieldDue;
+        uint256 yieldDue = _accruedYield[msg.sender][token];
+
+        // ── Cap yield at available pool so principal is ALWAYS withdrawable ──
+        // Yield pool = vault balance minus all deposited principals.
+        // Any yield not paid now stays in _accruedYield for future claimYield() calls.
+        uint256 yieldPool;
+        if (token == DOT) {
+            yieldPool = address(this).balance > _tvl[DOT]
+                ? address(this).balance - _tvl[DOT]
+                : 0;
+        } else {
+            uint256 vaultBal = IERC20Precompile(USDT).balanceOf(address(this));
+            yieldPool = vaultBal > _tvl[USDT]
+                ? vaultBal - _tvl[USDT]
+                : 0;
+        }
+        uint256 actualYield    = yieldDue > yieldPool ? yieldPool : yieldDue;
+        uint256 remainingYield = yieldDue - actualYield;
+        uint256 totalPayout    = amount + actualYield;
 
         // ── Checks-Effects-Interactions: update state BEFORE external call ──
-        _balances[msg.sender][token]   -= amount;
-        _tvl[token]                    -= amount;
-        _accruedYield[msg.sender][token] = 0;   // yield claimed — reset to prevent double-payout
+        _balances[msg.sender][token]    -= amount;
+        _tvl[token]                     -= amount;
+        _accruedYield[msg.sender][token] = remainingYield; // preserve unclaimed yield
 
         if (token == DOT) {
-            // totalPayout = principal + accrued yield
-            // Vault receives XCM yield returns via receive() — if balance is insufficient,
-            // the call reverts (user should wait for XCM return or owner to fund yield pool)
             (bool ok,) = payable(msg.sender).call{value: totalPayout}("");
             if (!ok) revert TransferFailed();
 
@@ -165,6 +182,7 @@ contract VeylaVault {
 
     /// @notice Claim accrued yield without withdrawing the principal.
     ///         Useful for harvesting yield while keeping the position open.
+    ///         Capped at available yield pool — if pool is empty, reverts with ZeroAmount.
     /// @param  token  address(0) for DOT, USDT_PRECOMPILE for USDT.
     function claimYield(address token) external notPaused {
         if (token != DOT && token != USDT) revert UnsupportedToken();
@@ -175,19 +193,34 @@ contract VeylaVault {
         uint256 yieldDue = _accruedYield[msg.sender][token];
         if (yieldDue == 0) revert ZeroAmount();
 
-        // Reset yield before transfer (CEI)
-        _accruedYield[msg.sender][token] = 0;
+        // Cap at available yield pool (same logic as withdraw)
+        uint256 yieldPool;
+        if (token == DOT) {
+            yieldPool = address(this).balance > _tvl[DOT]
+                ? address(this).balance - _tvl[DOT]
+                : 0;
+        } else {
+            uint256 vaultBal = IERC20Precompile(USDT).balanceOf(address(this));
+            yieldPool = vaultBal > _tvl[USDT]
+                ? vaultBal - _tvl[USDT]
+                : 0;
+        }
+        if (yieldPool == 0) revert ZeroAmount();
+
+        uint256 actualYield = yieldDue > yieldPool ? yieldPool : yieldDue;
+
+        // CEI: update state before transfer
+        _accruedYield[msg.sender][token] = yieldDue - actualYield;
 
         if (token == DOT) {
-            (bool ok,) = payable(msg.sender).call{value: yieldDue}("");
+            (bool ok,) = payable(msg.sender).call{value: actualYield}("");
             if (!ok) revert TransferFailed();
         } else {
-            bool ok = IERC20Precompile(USDT).transfer(msg.sender, yieldDue);
+            bool ok = IERC20Precompile(USDT).transfer(msg.sender, actualYield);
             if (!ok) revert TransferFailed();
         }
 
-        // Reuse Withdrawn event with just the yield amount (type distinction via on-chain analysis)
-        emit Withdrawn(msg.sender, token, yieldDue);
+        emit YieldClaimed(msg.sender, token, actualYield);
     }
 
     // ── Read (matches frontend ABI exactly) ───────────────────────────────

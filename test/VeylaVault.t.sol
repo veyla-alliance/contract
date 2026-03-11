@@ -286,6 +286,97 @@ contract VeylaVaultTest is Test {
         assertGt(yield, 0);
     }
 
+    // ── Withdraw: yield pool cap (H-1) ───────────────────────────────────
+
+    function test_withdraw_principalSafeWhenYieldPoolEmpty() public {
+        // Deposit 10 DOT, wait for yield to accrue, but DON'T fund the yield pool.
+        // Principal must still be returned even though yield can't be paid.
+        uint256 principal = 10 ether;
+        vm.prank(alice);
+        vault.deposit{value: principal}(address(0), 0);
+
+        vm.warp(block.timestamp + 30 days);
+
+        uint256 yieldAccrued = vault.earned(alice, address(0));
+        assertGt(yieldAccrued, 0);
+
+        uint256 balBefore = alice.balance;
+        vm.prank(alice);
+        vault.withdraw(address(0), principal); // must NOT revert
+
+        // Alice got back principal only (yield pool was empty)
+        assertEq(alice.balance, balBefore + principal);
+        // Remaining yield preserved in accrued mapping for future claim
+        assertEq(vault.earned(alice, address(0)), yieldAccrued);
+    }
+
+    function test_withdraw_paysYieldWhenPoolFunded() public {
+        uint256 principal = 10 ether;
+        vm.prank(alice);
+        vault.deposit{value: principal}(address(0), 0);
+
+        vm.warp(block.timestamp + 30 days);
+        uint256 yieldAccrued = vault.earned(alice, address(0));
+
+        // Owner funds yield pool
+        vault.fundYieldPool{value: yieldAccrued}();
+
+        uint256 balBefore = alice.balance;
+        vm.prank(alice);
+        vault.withdraw(address(0), principal);
+
+        // Alice gets principal + full yield
+        assertGe(alice.balance, balBefore + principal + yieldAccrued - 1); // -1 wei tolerance
+        assertEq(vault.balanceOf(alice, address(0)), 0);
+    }
+
+    // ── claimYield: YieldClaimed event (H-2) ─────────────────────────────
+
+    function test_claimYield_emitsYieldClaimedNotWithdrawn() public {
+        uint256 principal = 10 ether;
+        vm.prank(alice);
+        vault.deposit{value: principal}(address(0), 0);
+
+        vm.warp(block.timestamp + 30 days);
+        uint256 yieldAccrued = vault.earned(alice, address(0));
+
+        vault.fundYieldPool{value: yieldAccrued}();
+
+        vm.expectEmit(true, true, false, false);
+        emit VeylaVault.YieldClaimed(alice, address(0), yieldAccrued);
+
+        vm.prank(alice);
+        vault.claimYield(address(0));
+    }
+
+    function test_claimYield_principalUntouched() public {
+        uint256 principal = 10 ether;
+        vm.prank(alice);
+        vault.deposit{value: principal}(address(0), 0);
+
+        vm.warp(block.timestamp + 30 days);
+        uint256 yieldAccrued = vault.earned(alice, address(0));
+        vault.fundYieldPool{value: yieldAccrued}();
+
+        vm.prank(alice);
+        vault.claimYield(address(0));
+
+        // Principal must remain intact
+        assertEq(vault.balanceOf(alice, address(0)), principal);
+    }
+
+    function test_claimYield_revertIfPoolEmpty() public {
+        uint256 principal = 10 ether;
+        vm.prank(alice);
+        vault.deposit{value: principal}(address(0), 0);
+
+        vm.warp(block.timestamp + 30 days);
+        // No fundYieldPool call — pool is empty
+        vm.prank(alice);
+        vm.expectRevert(VeylaVault.ZeroAmount.selector);
+        vault.claimYield(address(0));
+    }
+
     // ── TVL ───────────────────────────────────────────────────────────────
 
     function test_tvl_combinedAssets() public {
