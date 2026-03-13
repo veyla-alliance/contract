@@ -9,3 +9,6 @@ lib/
 
 # MacOS
 .DS_Store
+
+# Claude Code
+CLAUDE.md
