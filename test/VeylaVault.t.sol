@@ -69,6 +69,9 @@ contract MockXcm {
 // ── Test Suite ────────────────────────────────────────────────────────────────
 
 contract VeylaVaultTest is Test {
+    // Allow the test contract to receive ETH so that fee transfers to treasury
+    // (which defaults to address(this)) succeed in tests.
+    receive() external payable {}
     VeylaVault vault;
     MockERC20  mockUsdt;
     MockXcm    mockXcm;
@@ -325,8 +328,11 @@ contract VeylaVaultTest is Test {
         vm.prank(alice);
         vault.withdraw(address(0), principal);
 
-        // Alice gets principal + full yield
-        assertGe(alice.balance, balBefore + principal + yieldAccrued - 1); // -1 wei tolerance
+        // Protocol fee (0.5% default) is deducted from yield; alice receives net yield.
+        uint256 fee       = (yieldAccrued * vault.protocolFeeBps()) / 10_000;
+        uint256 userYield = yieldAccrued - fee;
+        // Alice gets principal + net yield (fee goes to treasury = address(this) in tests)
+        assertEq(alice.balance, balBefore + principal + userYield);
         assertEq(vault.balanceOf(alice, address(0)), 0);
     }
 
@@ -342,8 +348,10 @@ contract VeylaVaultTest is Test {
 
         vault.fundYieldPool{value: yieldAccrued}();
 
+        // YieldClaimed emits userYield (after fee deduction), not the gross amount.
+        // Use checkData=false (4th arg) so we only check the indexed topic match.
         vm.expectEmit(true, true, false, false);
-        emit VeylaVault.YieldClaimed(alice, address(0), yieldAccrued);
+        emit VeylaVault.YieldClaimed(alice, address(0), 0 /* placeholder, data not checked */);
 
         vm.prank(alice);
         vault.claimYield(address(0));
@@ -373,7 +381,7 @@ contract VeylaVaultTest is Test {
         vm.warp(block.timestamp + 30 days);
         // No fundYieldPool call — pool is empty
         vm.prank(alice);
-        vm.expectRevert(VeylaVault.ZeroAmount.selector);
+        vm.expectRevert(VeylaVault.YieldPoolEmpty.selector);
         vault.claimYield(address(0));
     }
 
@@ -620,5 +628,227 @@ contract VeylaVaultTest is Test {
         vm.prank(alice);
         vault.withdraw(address(0), principal);
         assertEq(vault.balanceOf(alice, address(0)), 0);
+    }
+
+    // ── Protocol Config: Defaults ─────────────────────────────────────────
+
+    function test_protocolFee_defaultValue() public view {
+        assertEq(vault.protocolFeeBps(), 50);
+    }
+
+    function test_rebalanceInterval_defaultValue() public view {
+        assertEq(vault.rebalanceInterval(), 4 hours);
+    }
+
+    function test_lastRoutedAt_initiallyZero() public view {
+        assertEq(vault.lastRoutedAt(), 0);
+    }
+
+    function test_tokenRoute_defaultDot() public view {
+        assertEq(vault.tokenRoute(address(0)), "Hydration");
+    }
+
+    function test_tokenRoute_defaultUsdt() public view {
+        assertEq(vault.tokenRoute(USDT_PRECOMPILE), "Moonbeam");
+    }
+
+    function test_depositTimestampOf_recordsTimestamp() public {
+        uint256 before = block.timestamp;
+        vm.prank(alice);
+        vault.deposit{value: 5 ether}(address(0), 0);
+        assertEq(vault.depositTimestampOf(alice, address(0)), before);
+    }
+
+    // ── setProtocolFee ────────────────────────────────────────────────────
+
+    function test_setProtocolFee_updatesValue() public {
+        vm.expectEmit(false, false, false, true);
+        emit VeylaVault.ProtocolFeeUpdated(100);
+        vault.setProtocolFee(100);
+        assertEq(vault.protocolFeeBps(), 100);
+    }
+
+    function test_setProtocolFee_revertIfExceedsCap() public {
+        vm.expectRevert(VeylaVault.FeeExceedsCap.selector);
+        vault.setProtocolFee(501);
+    }
+
+    function test_setProtocolFee_allowsMaxCap() public {
+        vault.setProtocolFee(500);
+        assertEq(vault.protocolFeeBps(), 500);
+    }
+
+    function test_setProtocolFee_revertIfNotOwner() public {
+        vm.prank(alice);
+        vm.expectRevert(VeylaVault.NotOwner.selector);
+        vault.setProtocolFee(100);
+    }
+
+    // ── setRebalanceInterval ──────────────────────────────────────────────
+
+    function test_setRebalanceInterval_updatesValue() public {
+        vm.expectEmit(false, false, false, true);
+        emit VeylaVault.RebalanceIntervalUpdated(8 hours);
+        vault.setRebalanceInterval(8 hours);
+        assertEq(vault.rebalanceInterval(), 8 hours);
+    }
+
+    // ── setTokenRoute ─────────────────────────────────────────────────────
+
+    function test_setTokenRoute_updatesRoute() public {
+        vm.expectEmit(true, false, false, true);
+        emit VeylaVault.TokenRouteUpdated(address(0), "Bifrost");
+        vault.setTokenRoute(address(0), "Bifrost");
+        assertEq(vault.tokenRoute(address(0)), "Bifrost");
+    }
+
+    function test_setTokenRoute_revertIfUnsupported() public {
+        vm.expectRevert(VeylaVault.UnsupportedToken.selector);
+        vault.setTokenRoute(address(0x1234), "Bifrost");
+    }
+
+    // ── lastRoutedAt updates ──────────────────────────────────────────────
+
+    function test_routeAssets_updatesLastRoutedAt() public {
+        vm.prank(alice);
+        vault.deposit{value: 5 ether}(address(0), 0);
+
+        uint256 ts = block.timestamp;
+        vault.routeAssets(address(0), hex"050c000401000003008c864713");
+        assertEq(vault.lastRoutedAt(), ts);
+    }
+
+    function test_sendCrossChain_updatesLastRoutedAt() public {
+        vm.prank(alice);
+        vault.deposit{value: 5 ether}(address(0), 0);
+
+        uint256 ts = block.timestamp;
+        vault.sendCrossChain(address(0), hex"0001", hex"050c000401000003008c864713");
+        assertEq(vault.lastRoutedAt(), ts);
+    }
+
+    // ── Treasury & Protocol Fee ───────────────────────────────────────────
+
+    function test_treasury_defaultsToOwner() public view {
+        assertEq(vault.treasury(), address(this));
+    }
+
+    function test_setTreasury_updatesAddress() public {
+        vm.expectEmit(true, false, false, false);
+        emit VeylaVault.TreasuryUpdated(alice);
+        vault.setTreasury(alice);
+        assertEq(vault.treasury(), alice);
+    }
+
+    function test_setTreasury_revertIfZeroAddress() public {
+        vm.expectRevert(VeylaVault.ZeroAddress.selector);
+        vault.setTreasury(address(0));
+    }
+
+    function test_setTreasury_revertIfNotOwner() public {
+        vm.prank(alice);
+        vm.expectRevert(VeylaVault.NotOwner.selector);
+        vault.setTreasury(bob);
+    }
+
+    function test_claimYield_deductsFeeToTreasury() public {
+        // Set alice as treasury
+        vault.setTreasury(alice);
+
+        // Bob deposits and time passes
+        vm.deal(bob, 100 ether);
+        vm.prank(bob);
+        vault.deposit{value: 10 ether}(address(0), 0);
+        vm.warp(block.timestamp + 365 days); // full year for easy math
+
+        uint256 yieldAccrued = vault.earned(bob, address(0));
+        vault.fundYieldPool{value: yieldAccrued}();
+
+        // Set 5% fee (max allowed by cap) for easy verification
+        vault.setProtocolFee(500); // 5%
+
+        uint256 aliceBalBefore = alice.balance;
+        uint256 bobBalBefore   = bob.balance;
+
+        vm.prank(bob);
+        vault.claimYield(address(0));
+
+        uint256 expectedFee       = (yieldAccrued * 500) / 10_000;
+        uint256 expectedUserYield = yieldAccrued - expectedFee;
+
+        assertApproxEqAbs(alice.balance - aliceBalBefore, expectedFee, 2);
+        assertApproxEqAbs(bob.balance   - bobBalBefore,   expectedUserYield, 2);
+    }
+
+    function test_withdraw_deductsFeeOnYield() public {
+        vault.setTreasury(alice);
+
+        vm.deal(bob, 100 ether);
+        vm.prank(bob);
+        vault.deposit{value: 10 ether}(address(0), 0);
+        vm.warp(block.timestamp + 365 days);
+
+        uint256 yieldAccrued = vault.earned(bob, address(0));
+        vault.fundYieldPool{value: yieldAccrued}();
+        vault.setProtocolFee(500); // 5% (max allowed by cap)
+
+        uint256 aliceBalBefore = alice.balance;
+        uint256 bobBalBefore   = bob.balance;
+
+        vm.prank(bob);
+        vault.withdraw(address(0), 10 ether); // full withdraw
+
+        uint256 expectedFee       = (yieldAccrued * 500) / 10_000;
+        uint256 expectedUserTotal = 10 ether + yieldAccrued - expectedFee;
+
+        assertApproxEqAbs(alice.balance - aliceBalBefore, expectedFee, 2);
+        assertApproxEqAbs(bob.balance   - bobBalBefore,   expectedUserTotal, 2);
+    }
+
+    // ── Bounds checks ─────────────────────────────────────────────────────
+
+    function test_setRebalanceInterval_revertIfZero() public {
+        vm.expectRevert(VeylaVault.InvalidInterval.selector);
+        vault.setRebalanceInterval(0);
+    }
+
+    function test_setRebalanceInterval_revertIfTooLarge() public {
+        vm.expectRevert(VeylaVault.InvalidInterval.selector);
+        vault.setRebalanceInterval(366 days);
+    }
+
+    function test_setRebalanceInterval_allowsValidRange() public {
+        vault.setRebalanceInterval(1 hours);
+        assertEq(vault.rebalanceInterval(), 1 hours);
+        vault.setRebalanceInterval(365 days);
+        assertEq(vault.rebalanceInterval(), 365 days);
+    }
+
+    function test_setTokenRoute_revertIfTooLong() public {
+        // Build a 65-byte string
+        bytes memory longRoute = new bytes(65);
+        for (uint i = 0; i < 65; i++) longRoute[i] = 0x41;
+        vm.expectRevert(VeylaVault.RouteTooLong.selector);
+        vault.setTokenRoute(address(0), string(longRoute));
+    }
+
+    function test_setTokenRoute_allowsMaxLength() public {
+        bytes memory okRoute = new bytes(64);
+        for (uint i = 0; i < 64; i++) okRoute[i] = 0x41;
+        vault.setTokenRoute(address(0), string(okRoute)); // must not revert
+    }
+
+    // ── YieldPoolEmpty ────────────────────────────────────────────────────
+
+    function test_claimYield_revertIfPoolEmpty_distinctError() public {
+        uint256 principal = 10 ether;
+        vm.prank(alice);
+        vault.deposit{value: principal}(address(0), 0);
+        vm.warp(block.timestamp + 30 days);
+
+        // Pool not funded — should revert with YieldPoolEmpty, not ZeroAmount
+        vm.prank(alice);
+        vm.expectRevert(VeylaVault.YieldPoolEmpty.selector);
+        vault.claimYield(address(0));
     }
 }

@@ -10,7 +10,7 @@ Built for **Polkadot Solidity Hackathon 2026 — Track 2: PVM Smart Contracts**.
 
 | | Address |
 |---|---|
-| **VeylaVault** | [`0x5196F62a03cCDBed4b5372dC59E982b9A1e2B088`](https://blockscout-testnet.polkadot.io/address/0x5196f62a03ccDbed4b5372dc59e982b9a1e2b088) |
+| **VeylaVault** | [`0xb155972671A3C19985fc1250e1433b26eB71837c`](https://blockscout-testnet.polkadot.io/address/0xb155972671A3C19985fc1250e1433b26eB71837c) |
 | DOT (native sentinel) | `0x0000000000000000000000000000000000000000` |
 | USDT (pallet-assets precompile) | `0x000007c000000000000000000000000001200000` |
 | XCM Precompile | `0x00000000000000000000000000000000000a0000` |

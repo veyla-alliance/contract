@@ -25,6 +25,9 @@ contract VeylaVault {
     // Prevents catastrophic drain: owner cannot set APY above 100% (10_000 bps).
     uint256 public constant MAX_APY_BPS = 10_000;
 
+    // Protocol fee cap — owner cannot set fee above 5% (500 bps)
+    uint256 public constant MAX_PROTOCOL_FEE_BPS = 500;
+
     // ── State ─────────────────────────────────────────────────────────────
 
     address public owner;
@@ -48,6 +51,22 @@ contract VeylaVault {
     // token → total deposited (TVL per asset)
     mapping(address => uint256) private _tvl;
 
+    // ── Protocol Config ────────────────────────────────────────────────────
+    // Protocol fee on yield — mutable by owner, capped at MAX_PROTOCOL_FEE_BPS
+    uint256 public protocolFeeBps = 50;       // default 0.5%
+
+    // Target routing frequency (informational — not enforced on-chain)
+    uint256 public rebalanceInterval = 4 hours;
+
+    // Timestamp of the last XCM routing call (either routeAssets or sendCrossChain)
+    uint256 public lastRoutedAt;
+
+    // token → destination chain name (e.g. "Hydration", "Moonbeam")
+    mapping(address => string) private _tokenRoute;
+
+    // Treasury address — receives protocol fee on yield payouts
+    address public treasury;
+
     // ── Events ────────────────────────────────────────────────────────────
 
     event Deposited(address indexed user, address indexed token, uint256 amount);
@@ -60,6 +79,10 @@ contract VeylaVault {
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event YieldPoolFunded(address indexed from, uint256 amount);
+    event ProtocolFeeUpdated(uint256 newFeeBps);
+    event RebalanceIntervalUpdated(uint256 newInterval);
+    event TokenRouteUpdated(address indexed token, string route);
+    event TreasuryUpdated(address indexed newTreasury);
 
     // ── Errors ────────────────────────────────────────────────────────────
 
@@ -73,6 +96,10 @@ contract VeylaVault {
     error ApyExceedsCap();
     error ZeroAddress();
     error NoPendingOwner();
+    error FeeExceedsCap();
+    error InvalidInterval();
+    error RouteTooLong();
+    error YieldPoolEmpty();
 
     // ── Modifiers ─────────────────────────────────────────────────────────
 
@@ -93,6 +120,10 @@ contract VeylaVault {
         // Default APY — mirrors frontend display values
         _apyBps[DOT]  = 1420; // 14.20% → routed to Hydration Omnipool
         _apyBps[USDT] =  980; // 9.80%  → routed to Stellaswap on Moonbeam
+        // Default route destinations — mirrors frontend display
+        _tokenRoute[DOT]  = "Hydration";
+        _tokenRoute[USDT] = "Moonbeam";
+        treasury = msg.sender;
     }
 
     // ── Deposit ───────────────────────────────────────────────────────────
@@ -160,7 +191,9 @@ contract VeylaVault {
         }
         uint256 actualYield    = yieldDue > yieldPool ? yieldPool : yieldDue;
         uint256 remainingYield = yieldDue - actualYield;
-        uint256 totalPayout    = amount + actualYield;
+        uint256 fee         = (actualYield * protocolFeeBps) / 10_000;
+        uint256 userYield   = actualYield - fee;
+        uint256 totalPayout = amount + userYield;
 
         // ── Checks-Effects-Interactions: update state BEFORE external call ──
         _balances[msg.sender][token]    -= amount;
@@ -170,11 +203,17 @@ contract VeylaVault {
         if (token == DOT) {
             (bool ok,) = payable(msg.sender).call{value: totalPayout}("");
             if (!ok) revert TransferFailed();
-
+            if (fee > 0) {
+                (bool feeOk,) = payable(treasury).call{value: fee}("");
+                if (!feeOk) revert TransferFailed();
+            }
         } else if (token == USDT) {
             bool ok = IERC20Precompile(USDT).transfer(msg.sender, totalPayout);
             if (!ok) revert TransferFailed();
-
+            if (fee > 0) {
+                bool feeOk = IERC20Precompile(USDT).transfer(treasury, fee);
+                if (!feeOk) revert TransferFailed();
+            }
         } else {
             revert UnsupportedToken();
         }
@@ -207,22 +246,32 @@ contract VeylaVault {
                 ? vaultBal - _tvl[USDT]
                 : 0;
         }
-        if (yieldPool == 0) revert ZeroAmount();
+        if (yieldPool == 0) revert YieldPoolEmpty();
 
         uint256 actualYield = yieldDue > yieldPool ? yieldPool : yieldDue;
+        uint256 fee        = (actualYield * protocolFeeBps) / 10_000;
+        uint256 userYield  = actualYield - fee;
 
         // CEI: update state before transfer
         _accruedYield[msg.sender][token] = yieldDue - actualYield;
 
         if (token == DOT) {
-            (bool ok,) = payable(msg.sender).call{value: actualYield}("");
+            (bool ok,) = payable(msg.sender).call{value: userYield}("");
             if (!ok) revert TransferFailed();
+            if (fee > 0) {
+                (bool feeOk,) = payable(treasury).call{value: fee}("");
+                if (!feeOk) revert TransferFailed();
+            }
         } else {
-            bool ok = IERC20Precompile(USDT).transfer(msg.sender, actualYield);
+            bool ok = IERC20Precompile(USDT).transfer(msg.sender, userYield);
             if (!ok) revert TransferFailed();
+            if (fee > 0) {
+                bool feeOk = IERC20Precompile(USDT).transfer(treasury, fee);
+                if (!feeOk) revert TransferFailed();
+            }
         }
 
-        emit YieldClaimed(msg.sender, token, actualYield);
+        emit YieldClaimed(msg.sender, token, userYield);
     }
 
     // ── Read (matches frontend ABI exactly) ───────────────────────────────
@@ -256,6 +305,17 @@ contract VeylaVault {
         return _tvl[token];
     }
 
+    /// @notice Returns the block.timestamp of the user's last deposit (or last accrual snapshot).
+    ///         Returns 0 if the user has never deposited this token.
+    function depositTimestampOf(address user, address token) external view returns (uint256) {
+        return _depositTimestamps[user][token];
+    }
+
+    /// @notice Returns the destination chain name for a given token (e.g. "Hydration").
+    function tokenRoute(address token) external view returns (string memory) {
+        return _tokenRoute[token];
+    }
+
     // ── Admin: XCM Routing ────────────────────────────────────────────────
 
     /// @notice Execute an XCM message locally via Polkadot Hub's XCM precompile.
@@ -275,6 +335,7 @@ contract VeylaVault {
         // Execute XCM message via Polkadot Hub native precompile
         IXcm(XCM_PRECOMPILE).execute(xcmMessage, weight);
 
+        lastRoutedAt = block.timestamp;
         emit RoutedLocally(token, _tvl[token]);
     }
 
@@ -293,6 +354,7 @@ contract VeylaVault {
         // Send XCM message cross-chain to target parachain
         IXcm(XCM_PRECOMPILE).send(destination, xcmMessage);
 
+        lastRoutedAt = block.timestamp;
         emit RoutedCrossChain(token, destination, _tvl[token]);
     }
 
@@ -337,6 +399,37 @@ contract VeylaVault {
     function fundYieldPool() external payable onlyOwner {
         // Simply accept the transfer — vault balance increases, enabling yield payouts.
         emit YieldPoolFunded(msg.sender, msg.value);
+    }
+
+    /// @notice Set the protocol fee on yield (owner only).
+    /// @param  feeBps  New fee in basis points. Capped at MAX_PROTOCOL_FEE_BPS (500 = 5%).
+    function setProtocolFee(uint256 feeBps) external onlyOwner {
+        if (feeBps > MAX_PROTOCOL_FEE_BPS) revert FeeExceedsCap();
+        protocolFeeBps = feeBps;
+        emit ProtocolFeeUpdated(feeBps);
+    }
+
+    /// @notice Set the target rebalance interval (owner only, informational).
+    /// @param  interval  Must be between 1 hour and 365 days (inclusive).
+    function setRebalanceInterval(uint256 interval) external onlyOwner {
+        if (interval < 1 hours || interval > 365 days) revert InvalidInterval();
+        rebalanceInterval = interval;
+        emit RebalanceIntervalUpdated(interval);
+    }
+
+    /// @notice Update the destination chain name for a token (owner only).
+    function setTokenRoute(address token, string calldata route) external onlyOwner {
+        if (token != DOT && token != USDT) revert UnsupportedToken();
+        if (bytes(route).length > 64) revert RouteTooLong();
+        _tokenRoute[token] = route;
+        emit TokenRouteUpdated(token, route);
+    }
+
+    /// @notice Update the treasury address that receives protocol fees (owner only).
+    function setTreasury(address newTreasury) external onlyOwner {
+        if (newTreasury == address(0)) revert ZeroAddress();
+        treasury = newTreasury;
+        emit TreasuryUpdated(newTreasury);
     }
 
     // ── Internal ──────────────────────────────────────────────────────────
