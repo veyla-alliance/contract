@@ -25,6 +25,11 @@ contract VeylaVault {
     // Prevents catastrophic drain: owner cannot set APY above 100% (10_000 bps).
     uint256 public constant MAX_APY_BPS = 10_000;
 
+    // ── XCM message size cap ──────────────────────────────────────────────
+    // A valid XCM message for asset routing is never more than 1 KB.
+    // Prevents bloated calldata griefing via large xcmMessage payloads.
+    uint256 public constant MAX_XCM_MESSAGE_SIZE = 1024;
+
     // Protocol fee cap — owner cannot set fee above 5% (500 bps)
     uint256 public constant MAX_PROTOCOL_FEE_BPS = 500;
 
@@ -67,6 +72,13 @@ contract VeylaVault {
     // Treasury address — receives protocol fee on yield payouts
     address public treasury;
 
+    // Pending treasury address — must call acceptTreasury() to activate (2-step pattern)
+    address public pendingTreasury;
+
+    // XCM destination whitelist — keccak256(destinationBytes) → allowed
+    // Prevents sendCrossChain from routing to arbitrary parachains
+    mapping(bytes32 => bool) public trustedDestinations;
+
     // ── Events ────────────────────────────────────────────────────────────
 
     event Deposited(address indexed user, address indexed token, uint256 amount);
@@ -83,6 +95,9 @@ contract VeylaVault {
     event RebalanceIntervalUpdated(uint256 newInterval);
     event TokenRouteUpdated(address indexed token, string route);
     event TreasuryUpdated(address indexed newTreasury);
+    event TreasuryProposed(address indexed newTreasury);
+    event TrustedDestinationAdded(bytes destination);
+    event TrustedDestinationRemoved(bytes destination);
 
     // ── Errors ────────────────────────────────────────────────────────────
 
@@ -100,6 +115,9 @@ contract VeylaVault {
     error InvalidInterval();
     error RouteTooLong();
     error YieldPoolEmpty();
+    error UntrustedDestination();
+    error XcmMessageTooLarge();
+    error NotPendingTreasury();
 
     // ── Modifiers ─────────────────────────────────────────────────────────
 
@@ -328,6 +346,7 @@ contract VeylaVault {
         bytes calldata xcmMessage
     ) external onlyOwner {
         if (_tvl[token] == 0) revert ZeroAmount();
+        if (xcmMessage.length > MAX_XCM_MESSAGE_SIZE) revert XcmMessageTooLarge();
 
         // Estimate weight required for XCM execution (Polkadot Hub precompile call)
         IXcm.Weight memory weight = IXcm(XCM_PRECOMPILE).weighMessage(xcmMessage);
@@ -350,6 +369,8 @@ contract VeylaVault {
         bytes calldata xcmMessage
     ) external onlyOwner {
         if (_tvl[token] == 0) revert ZeroAmount();
+        if (!trustedDestinations[keccak256(destination)]) revert UntrustedDestination();
+        if (xcmMessage.length > MAX_XCM_MESSAGE_SIZE) revert XcmMessageTooLarge();
 
         // Send XCM message cross-chain to target parachain
         IXcm(XCM_PRECOMPILE).send(destination, xcmMessage);
@@ -364,6 +385,7 @@ contract VeylaVault {
     /// @param  apyBps  New APY in basis points (e.g. 1420 = 14.20%).
     ///                 Capped at MAX_APY_BPS (10_000 = 100%) to prevent drain attacks.
     function setApy(address token, uint256 apyBps) external onlyOwner {
+        if (token != DOT && token != USDT) revert UnsupportedToken();
         if (apyBps > MAX_APY_BPS) revert ApyExceedsCap();
         _apyBps[token] = apyBps;
         emit ApyUpdated(token, apyBps);
@@ -425,11 +447,35 @@ contract VeylaVault {
         emit TokenRouteUpdated(token, route);
     }
 
-    /// @notice Update the treasury address that receives protocol fees (owner only).
-    function setTreasury(address newTreasury) external onlyOwner {
+    /// @notice Step 1 — Propose a new treasury address.
+    ///         The new address must call acceptTreasury() to activate.
+    ///         This prevents mis-typed addresses from silently redirecting protocol fees.
+    function proposeTreasury(address newTreasury) external onlyOwner {
         if (newTreasury == address(0)) revert ZeroAddress();
-        treasury = newTreasury;
-        emit TreasuryUpdated(newTreasury);
+        pendingTreasury = newTreasury;
+        emit TreasuryProposed(newTreasury);
+    }
+
+    /// @notice Step 2 — Pending treasury accepts and activates.
+    ///         Only callable by the address nominated in proposeTreasury().
+    function acceptTreasury() external {
+        if (msg.sender != pendingTreasury) revert NotPendingTreasury();
+        treasury = pendingTreasury;
+        pendingTreasury = address(0);
+        emit TreasuryUpdated(treasury);
+    }
+
+    /// @notice Whitelist a cross-chain destination for sendCrossChain() (owner only).
+    /// @param  destination  SCALE-encoded XCM MultiLocation bytes of the trusted parachain.
+    function addTrustedDestination(bytes calldata destination) external onlyOwner {
+        trustedDestinations[keccak256(destination)] = true;
+        emit TrustedDestinationAdded(destination);
+    }
+
+    /// @notice Remove a cross-chain destination from the whitelist (owner only).
+    function removeTrustedDestination(bytes calldata destination) external onlyOwner {
+        trustedDestinations[keccak256(destination)] = false;
+        emit TrustedDestinationRemoved(destination);
     }
 
     // ── Internal ──────────────────────────────────────────────────────────
@@ -442,7 +488,11 @@ contract VeylaVault {
     }
 
     /// @dev Calculate yield earned since the last snapshot (not yet saved to storage).
-    ///      Formula: principal × APY% × elapsed / 365 days
+    ///      Formula: principal × APY_bps × elapsed / (365 days × 10_000)
+    ///      Uses integer division — for DOT (18 decimals) precision is sub-wei.
+    ///      For USDT (6 decimals), amounts below ~0.001 USDT for short durations
+    ///      may truncate to 0; this is acceptable given the minimum practical deposit size.
+    ///      Returns 0 if principal or timestamp is zero.
     function _pendingYield(address user, address token) internal view returns (uint256) {
         uint256 principal = _balances[user][token];
         if (principal == 0) return 0;

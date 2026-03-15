@@ -441,10 +441,35 @@ contract VeylaVaultTest is Test {
         bytes memory dest   = hex"0001";
         bytes memory xcmMsg = hex"050c000401000003008c864713";
 
+        // Whitelist destination before routing
+        vault.addTrustedDestination(dest);
+
         vm.expectEmit(true, false, false, false);
         emit VeylaVault.RoutedCrossChain(address(0), dest, 5 ether);
 
         vault.sendCrossChain(address(0), dest, xcmMsg);
+    }
+
+    function test_sendCrossChain_revertIfUntrustedDestination() public {
+        vm.prank(alice);
+        vault.deposit{value: 5 ether}(address(0), 0);
+
+        // dest NOT whitelisted
+        bytes memory dest   = hex"0002";
+        bytes memory xcmMsg = hex"050c000401000003008c864713";
+
+        vm.expectRevert(VeylaVault.UntrustedDestination.selector);
+        vault.sendCrossChain(address(0), dest, xcmMsg);
+    }
+
+    function test_routeAssets_revertIfMessageTooLarge() public {
+        vm.prank(alice);
+        vault.deposit{value: 5 ether}(address(0), 0);
+
+        // Build a 1025-byte XCM message (over the 1024 cap)
+        bytes memory bigMsg = new bytes(1025);
+        vm.expectRevert(VeylaVault.XcmMessageTooLarge.selector);
+        vault.routeAssets(address(0), bigMsg);
     }
 
     function test_routeAssets_revertIfNotOwner() public {
@@ -504,6 +529,11 @@ contract VeylaVaultTest is Test {
         vm.assume(apyBps > 10_000);
         vm.expectRevert(VeylaVault.ApyExceedsCap.selector);
         vault.setApy(address(0), apyBps);
+    }
+
+    function test_setApy_revertIfUnsupportedToken() public {
+        vm.expectRevert(VeylaVault.UnsupportedToken.selector);
+        vault.setApy(address(0x1234), 500);
     }
 
     // ── transferOwnership: 2-step ─────────────────────────────────────────
@@ -722,6 +752,8 @@ contract VeylaVaultTest is Test {
         vm.prank(alice);
         vault.deposit{value: 5 ether}(address(0), 0);
 
+        vault.addTrustedDestination(hex"0001");
+
         uint256 ts = block.timestamp;
         vault.sendCrossChain(address(0), hex"0001", hex"050c000401000003008c864713");
         assertEq(vault.lastRoutedAt(), ts);
@@ -733,27 +765,46 @@ contract VeylaVaultTest is Test {
         assertEq(vault.treasury(), address(this));
     }
 
-    function test_setTreasury_updatesAddress() public {
+    function test_proposeTreasury_doesNotUpdateImmediately() public {
+        vault.proposeTreasury(alice);
+        // Treasury stays at old value until alice accepts
+        assertEq(vault.treasury(), address(this));
+        assertEq(vault.pendingTreasury(), alice);
+    }
+
+    function test_acceptTreasury_completesTransfer() public {
+        vault.proposeTreasury(alice);
         vm.expectEmit(true, false, false, false);
         emit VeylaVault.TreasuryUpdated(alice);
-        vault.setTreasury(alice);
+        vm.prank(alice);
+        vault.acceptTreasury();
         assertEq(vault.treasury(), alice);
+        assertEq(vault.pendingTreasury(), address(0));
     }
 
-    function test_setTreasury_revertIfZeroAddress() public {
+    function test_proposeTreasury_revertIfZeroAddress() public {
         vm.expectRevert(VeylaVault.ZeroAddress.selector);
-        vault.setTreasury(address(0));
+        vault.proposeTreasury(address(0));
     }
 
-    function test_setTreasury_revertIfNotOwner() public {
+    function test_proposeTreasury_revertIfNotOwner() public {
         vm.prank(alice);
         vm.expectRevert(VeylaVault.NotOwner.selector);
-        vault.setTreasury(bob);
+        vault.proposeTreasury(bob);
+    }
+
+    function test_acceptTreasury_revertIfNotPending() public {
+        vault.proposeTreasury(alice);
+        vm.prank(bob); // bob is not pendingTreasury
+        vm.expectRevert(VeylaVault.NotPendingTreasury.selector);
+        vault.acceptTreasury();
     }
 
     function test_claimYield_deductsFeeToTreasury() public {
-        // Set alice as treasury
-        vault.setTreasury(alice);
+        // Set alice as treasury (2-step)
+        vault.proposeTreasury(alice);
+        vm.prank(alice);
+        vault.acceptTreasury();
 
         // Bob deposits and time passes
         vm.deal(bob, 100 ether);
@@ -781,7 +832,9 @@ contract VeylaVaultTest is Test {
     }
 
     function test_withdraw_deductsFeeOnYield() public {
-        vault.setTreasury(alice);
+        vault.proposeTreasury(alice);
+        vm.prank(alice);
+        vault.acceptTreasury();
 
         vm.deal(bob, 100 ether);
         vm.prank(bob);
