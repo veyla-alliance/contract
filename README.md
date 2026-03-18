@@ -10,7 +10,7 @@ Built for **Polkadot Solidity Hackathon 2026 — Track 2: PVM Smart Contracts**.
 
 | | Address |
 |---|---|
-| **VeylaVault** | [`0xa93C92894af013652209db6155b13f115B30331E`](https://blockscout-testnet.polkadot.io/address/0xa93C92894af013652209db6155b13f115B30331E) |
+| **VeylaVault** | [`0xc66ee6f7CA593fbbccEd23d8c50417C058F1EF77`](https://blockscout-testnet.polkadot.io/address/0xc66ee6f7CA593fbbccEd23d8c50417C058F1EF77) |
 | DOT (native sentinel) | `0x0000000000000000000000000000000000000000` |
 | USDT (pallet-assets precompile) | `0x000007c000000000000000000000000001200000` |
 | XCM Precompile | `0x00000000000000000000000000000000000a0000` |
@@ -86,7 +86,7 @@ forge build
 forge test -v
 ```
 
-**50 tests, 0 failures** (4 fuzz tests, 256 runs each):
+**82 tests, 0 failures** (4 fuzz tests, 256 runs each):
 
 ```
 [PASS] testFuzz_depositAndWithdrawDot          (256 runs)
@@ -110,7 +110,7 @@ forge test -v
 [PASS] test_acceptOwnership_revertIfNotPending / revertIfWrongAddress
 [PASS] test_fundYieldPool_emitsEvent
 [PASS] test_receive_emitsYieldPoolFunded
-Suite result: ok. 50 passed; 0 failed
+Suite result: ok. 82 passed; 0 failed
 ```
 
 ### Deploy
@@ -144,7 +144,7 @@ contract/
 │       ├── IXcm.sol                # XCM precompile interface
 │       └── IERC20Precompile.sol    # pallet-assets ERC-20 interface
 ├── test/
-│   └── VeylaVault.t.sol            # 50 unit + fuzz tests
+│   └── VeylaVault.t.sol            # 82 unit + fuzz tests
 ├── script/
 │   └── Deploy.s.sol                # Foundry deploy script
 ├── foundry.toml                    # Foundry config (Passet Hub RPC + Blockscout verifier)
